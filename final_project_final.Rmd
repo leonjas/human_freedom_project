@@ -1,0 +1,622 @@
+---
+title: "Untitled"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+date: "2025-05-07"
+---
+```{r}
+library(dplyr)
+library(tidyr)    
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(patchwork)
+library(mgcv)
+library(randomForest)
+library(splines)
+library(caret)
+```
+
+Data Preprocessing - Remove/Impute missing values, Remove outliers, Create 3-category income group
+```{r}
+freedom_byincome <- read.csv("/Users/audrey/Downloads/merged_data_income_class.csv")
+summary(freedom_byincome)
+```
+
+```{r}
+country_income_mode <- freedom_byincome %>%
+  group_by(Country, Income_Group) %>%
+  tally() %>%
+  group_by(Country) %>%
+  slice_max(order_by = n, n = 1, with_ties = FALSE) %>%
+  dplyr::select(Country, income_group_mode = Income_Group)
+
+freedom_income <- freedom_byincome %>%
+  left_join(country_income_mode, by = "Country")
+
+freedom_income <- freedom_income %>%
+  mutate(
+    income_group_3cat = case_when(
+    income_group_mode == "High-income countries" ~ "high",
+    income_group_mode %in% c("Upper-middle-income countries", 
+                             "Lower-middle-income countries") ~ "middle",
+    income_group_mode == "Low-income countries" ~ "low"
+    )
+  )
+```
+
+```{r}
+missing_percent <- freedom_income %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100))
+
+missing_percent <- pivot_longer(missing_percent, cols = everything(),
+                                names_to = "variable", values_to = "missing_percentage")
+
+print(missing_percent)
+```
+
+```{r}
+# missing value > 40%
+na_percent <- colMeans(is.na(freedom_income)) * 100
+high_missing_vars <- names(na_percent[na_percent > 40])
+high_missing_vars
+```
+
+```{r}
+med_missing_vars <- names(na_percent[na_percent > 0])
+med_missing_vars
+```
+
+```{r}
+freedom_cleaned <- freedom_income %>%
+  dplyr::select(-c(literacy_rate, Gini_index)) %>%
+  filter(!is.na(HF)) %>%
+  filter(
+    cpi <= 100,
+    Intentional_Homicides <= 100,
+    infant_mortality <= 100
+  )
+```
+
+```{r}
+med_missing_vars <- c("SG", "Gender_Disparity_Index", "FTI", "gdp_per_capita", 
+                      "cpi", "infant_mortality", "unemployment_rate", "intnet_use",
+                      "Education_Expenditure", "Medical_Expenditure",
+                      "Intentional_Homicides", "Political_Stability")
+
+freedom_cleaned <- freedom_cleaned %>%
+  mutate(across(all_of(med_missing_vars), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+```
+
+
+Linear Model
+```{r}
+freedom_cleaned$log_gdp <- log(freedom_cleaned$gdp_per_capita)
+freedom_cleaned$income_group_3cat <- factor(freedom_cleaned$income_group_3cat)
+freedom_cleaned$income_group_3cat <- relevel(freedom_cleaned$income_group_3cat, ref = "low")
+group_counts <- table(freedom_cleaned$income_group_3cat)
+freedom_cleaned$group_weight <- 1 / group_counts[freedom_cleaned$income_group_3cat]
+freedom_cleaned$group_weight <- freedom_cleaned$group_weight / mean(freedom_cleaned$group_weight)
+```
+
+need interaction
+```{r}
+model_nointeract <- lm(HF ~ log_gdp + cpi + infant_mortality + unemployment_rate + 
+                          intnet_use + Education_Expenditure + Medical_Expenditure +
+                          Intentional_Homicides + Political_Stability + income_group_3cat,
+                     data=freedom_cleaned)
+```
+
+```{r}
+model_interact <- lm(HF ~ (log_gdp + cpi + infant_mortality + unemployment_rate + 
+                          intnet_use + Education_Expenditure + Medical_Expenditure +
+                          Intentional_Homicides + Political_Stability) * income_group_3cat,
+                     data=freedom_cleaned, weights = group_weight)
+anova(model_nointeract, model_interact)
+summary(model_interact)
+```
+
+
+heteroskedasticity & non-linearity
+```{r}
+par(mfrow = c(2, 2))
+plot(model_interact)
+```
+
+heteroskedasticity
+```{r}
+library(lmtest)
+bptest(model_interact)
+```
+
+no severe multicollinearity
+```{r}
+library(car)
+vif_values <- vif(model_interact, type = "predictor")
+vif_df <- data.frame(vif_values)
+vif_df
+```
+
+nonparametric extension
+
+# LOESS to detect the nonlinearity
+```{r,warning=FALSE}
+vars <- c("log_gdp", "cpi", "infant_mortality", "unemployment_rate",
+          "intnet_use", "Education_Expenditure", "Medical_Expenditure",
+          "Intentional_Homicides", "Political_Stability")
+
+plot_list <- lapply(vars, function(var) {
+  ggplot(freedom_cleaned, aes(x = .data[[var]], y = log(HF))) +
+    geom_point(alpha = 0.4, color = "black") +
+    geom_smooth(method = "loess", se = TRUE, color = "blue") +
+    labs(title = paste("HF vs", var), x = var, y = "Human Freedom Score") +
+    theme_minimal()
+})
+
+wrap_plots(plotlist = plot_list, ncol = 3)
+```
+
+# Spline
+```{r,warning=FALSE}
+model_spline <- lm(HF ~ 
+                     ns(log_gdp, df = 4) +
+                     cpi +
+                     ns(infant_mortality, df = 4) +
+                     ns(unemployment_rate, df = 4) +
+                     intnet_use +
+                     ns(Education_Expenditure, df = 4) +
+                     ns(Medical_Expenditure, df = 4) +
+                     ns(Intentional_Homicides, df = 4) +
+                     Political_Stability +
+                     income_group_3cat,
+                   data = freedom_cleaned, weights = group_weight)
+```
+
+# Spline with interact
+```{r,warning=FALSE}
+model_spline_interact <- lm(HF ~ 
+  ns(log_gdp, df = 4) + 
+  cpi + 
+  ns(infant_mortality, df = 4) + 
+  ns(unemployment_rate, df = 4) + 
+  intnet_use + 
+  ns(Education_Expenditure, df = 4) + 
+  ns(Medical_Expenditure, df = 4) + 
+  ns(Intentional_Homicides, df = 4) + 
+  Political_Stability + 
+  income_group_3cat +
+
+  ns(infant_mortality, df = 4):income_group_3cat + 
+  ns(unemployment_rate, df = 4):income_group_3cat + 
+  ns(Education_Expenditure, df = 4):income_group_3cat + 
+  ns(Medical_Expenditure, df = 4):income_group_3cat + 
+  ns(Intentional_Homicides, df = 4):income_group_3cat +
+
+  cpi:income_group_3cat +
+  intnet_use:income_group_3cat +
+  Political_Stability:income_group_3cat,
+  
+  data = freedom_cleaned, weights = group_weight
+)
+
+AIC(model_spline,model_spline_interact)
+```
+
+\newpage
+```{r,echo=FALSE}
+library(knitr)
+spline_table <- as.data.frame(summary(model_spline_interact)$coefficients)
+
+colnames(spline_table) <- c("Estimate", "Std. Error", "t-value", "p-value")
+
+spline_table$Term <- rownames(spline_table)
+rownames(spline_table) <- NULL
+
+spline_table$Signif. <- cut(
+  spline_table$`p-value`,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf),
+  labels = c("***", "**", "*", ".", " "),
+  right = TRUE
+)
+
+spline_table <- spline_table[, c("Term", "Estimate", "Std. Error", "t-value", "p-value", "Signif.")]
+
+kable(spline_table, digits = 3, caption = "Table 3. Parametric coefficients from the spline interaction model.")
+
+```
+
+# Generalized Additive Model
+```{r,warning=FALSE}
+model_gam <- gam(HF ~ s(log_gdp) + cpi + s(infant_mortality) + s(unemployment_rate) +
+                      intnet_use + s(Education_Expenditure) + s(Medical_Expenditure) +
+                      s(Intentional_Homicides) + Political_Stability + income_group_3cat,
+                       data = freedom_cleaned,weights = group_weight)
+summary(model_gam)
+```
+
+# Add interaction term
+```{r,warning=FALSE}
+model_gam_interact <- gam(HF ~ 
+  s(log_gdp) +
+  s(infant_mortality) + s(infant_mortality, by = income_group_3cat) +
+  s(unemployment_rate) + s(unemployment_rate, by = income_group_3cat) +
+  s(Education_Expenditure) + s(Education_Expenditure, by = income_group_3cat) +
+  s(Medical_Expenditure) + s(Medical_Expenditure, by = income_group_3cat) +
+  s(Intentional_Homicides) + s(Intentional_Homicides, by = income_group_3cat) +
+  cpi + intnet_use + Political_Stability +
+  income_group_3cat +
+  cpi:income_group_3cat + intnet_use:income_group_3cat + Political_Stability:income_group_3cat,
+  data = freedom_cleaned, weights = group_weight
+)
+
+AIC(model_gam,model_gam_interact)
+```
+\newpage
+```{r,echo=FALSE}
+aic_compare <- AIC(model_spline, model_spline_interact,model_gam,model_gam_interact)
+kable(aic_compare, digits = 2, caption = "Table 4. AIC comparison between spline models.")
+```
+
+# Random Forest regression
+```{r,warning=FALSE}
+rf_model <- randomForest(HF ~ log_gdp + cpi + infant_mortality +
+                           unemployment_rate + intnet_use +
+                           Education_Expenditure + Medical_Expenditure +
+                           Intentional_Homicides + Political_Stability +
+                           income_group_3cat,
+                         data = freedom_cleaned,
+                         importance = TRUE, ntree = 500)
+
+pred_rf <- predict(rf_model)
+
+rss_rf <- sum((freedom_cleaned$HF - pred_rf)^2)
+tss <- sum((freedom_cleaned$HF - mean(freedom_cleaned$HF))^2) 
+rsq_rf <- 1 - rss_rf / tss
+rsq_rf
+varImpPlot(rf_model)
+```
+
+# Cross validation for Spline
+```{r,warning=FALSE}
+set.seed(5291)
+folds <- sample(rep(1:10, length.out = nrow(freedom_cleaned)))
+cv_results_spline <- data.frame(Fold = 1:10, RMSE = NA, Rsq = NA)
+
+for (k in 1:10) {
+  train_data <- freedom_cleaned[folds != k, ]
+  test_data  <- freedom_cleaned[folds == k, ]
+  
+  model_spline_interact <- lm(HF ~ 
+    ns(log_gdp, df = 4) + 
+    cpi + 
+    ns(infant_mortality, df = 4) + 
+    ns(unemployment_rate, df = 4) + 
+    intnet_use + 
+    ns(Education_Expenditure, df = 4) + 
+    ns(Medical_Expenditure, df = 4) + 
+    ns(Intentional_Homicides, df = 4) + 
+    Political_Stability + 
+    income_group_3cat +
+
+    ns(infant_mortality, df = 4):income_group_3cat + 
+    ns(unemployment_rate, df = 4):income_group_3cat + 
+    ns(Education_Expenditure, df = 4):income_group_3cat + 
+    ns(Medical_Expenditure, df = 4):income_group_3cat + 
+    ns(Intentional_Homicides, df = 4):income_group_3cat +
+
+    cpi:income_group_3cat +
+    intnet_use:income_group_3cat +
+    Political_Stability:income_group_3cat,
+  
+    data = train_data, weights = group_weight
+)
+  
+  preds <- predict(model_spline_interact, newdata = test_data)
+  actuals <- test_data$HF
+  
+  rss <- sum((preds - actuals)^2)
+  tss <- sum((actuals - mean(actuals))^2)
+  
+  cv_results_spline$RMSE[k] <- sqrt(mean((preds - actuals)^2))
+  cv_results_spline$Rsq[k] <- 1 - rss / tss
+}
+
+```
+
+# Cross validation for GAM
+```{r,warning=FALSE}
+set.seed(5291)
+folds <- sample(rep(1:10, length.out = nrow(freedom_cleaned)))
+
+cv_results <- data.frame(Fold = 1:10, RMSE = NA, Rsq = NA)
+
+for (k in 1:10) {
+  train_data <- freedom_cleaned[folds != k, ]
+  test_data  <- freedom_cleaned[folds == k, ]
+  
+  model_gam_interact <- gam(HF ~ 
+  s(log_gdp) +
+  s(infant_mortality) + s(infant_mortality, by = income_group_3cat) +
+  s(unemployment_rate) + s(unemployment_rate, by = income_group_3cat) +
+  s(Education_Expenditure) + s(Education_Expenditure, by = income_group_3cat) +
+  s(Medical_Expenditure) + s(Medical_Expenditure, by = income_group_3cat) +
+  s(Intentional_Homicides) + s(Intentional_Homicides, by = income_group_3cat) +
+  cpi + intnet_use + Political_Stability +
+  income_group_3cat +
+  cpi:income_group_3cat + intnet_use:income_group_3cat + Political_Stability:income_group_3cat,
+  data = train_data, weights = group_weight
+)
+  
+  pred <- predict(model_gam_interact, newdata = test_data)
+  obs <- test_data$HF
+  
+  rmse <- sqrt(mean((obs - pred)^2))
+  rsq  <- 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+  
+  cv_results[k, "RMSE"] <- rmse
+  cv_results[k, "Rsq"] <- rsq
+}
+
+```
+
+# Cross validation for random forest
+```{r,warning=FALSE}
+set.seed(5291)
+cv_results_rf <- data.frame(Fold = 1:10, RMSE = NA, Rsq = NA)
+
+for (k in 1:10) {
+  train_data <- freedom_cleaned[folds != k, ]
+  test_data  <- freedom_cleaned[folds == k, ]
+  
+  model_k <- randomForest(HF ~ log_gdp + cpi + infant_mortality +
+                            unemployment_rate + intnet_use +
+                            Education_Expenditure + Medical_Expenditure +
+                            Intentional_Homicides + Political_Stability +
+                            income_group_3cat,
+                          data = train_data,
+                          ntree = 500)
+  
+  pred <- predict(model_k, newdata = test_data)
+  obs <- test_data$HF
+  
+  rmse <- sqrt(mean((obs - pred)^2))
+  rsq  <- 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+  
+  cv_results_rf[k, "RMSE"] <- rmse
+  cv_results_rf[k, "Rsq"] <- rsq
+}
+```
+
+# Cross Validation for Linear model
+```{r}
+set.seed(5291)
+
+cv_results_lm <- data.frame(Fold = 1:10, RMSE = NA, Rsq = NA)
+folds <- sample(rep(1:10, length.out = nrow(freedom_cleaned)))
+
+for (k in 1:10) {
+  train_data <- freedom_cleaned[folds != k, ]
+  test_data  <- freedom_cleaned[folds == k, ]
+
+  model_k <- lm(HF ~ log_gdp + cpi + infant_mortality +
+                  unemployment_rate + intnet_use +
+                  Education_Expenditure + Medical_Expenditure +
+                  Intentional_Homicides + Political_Stability +
+                  income_group_3cat +
+                  cpi:income_group_3cat +
+                  infant_mortality:income_group_3cat +
+                  unemployment_rate:income_group_3cat +
+                  intnet_use:income_group_3cat +
+                  Education_Expenditure:income_group_3cat +
+                  Medical_Expenditure:income_group_3cat +
+                  Intentional_Homicides:income_group_3cat +
+                  Political_Stability:income_group_3cat,
+                data = train_data, weights=group_weight)
+
+  pred <- predict(model_k, newdata = test_data)
+  obs  <- test_data$HF
+
+  rmse <- sqrt(mean((obs - pred)^2))
+  rsq  <- 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+
+  cv_results_lm[k, "RMSE"] <- rmse
+  cv_results_lm[k, "Rsq"]  <- rsq
+}
+
+cv_results_lm
+
+```
+
+# Cross Validation Matrix
+\newpage
+```{r,warning=FALSE}
+mean_spline <- colMeans(cv_results_spline[ , c("RMSE", "Rsq")])
+mean_gam    <- colMeans(cv_results[ , c("RMSE", "Rsq")])
+mean_rf     <- colMeans(cv_results_rf[ , c("RMSE", "Rsq")])
+mean_lm     <- colMeans(cv_results_lm[ , c("RMSE", "Rsq")])
+cv_summary <- rbind(Linear = mean_lm,
+                    Spline = mean_spline,
+                    GAM = mean_gam,
+                    RF = mean_rf)
+cv_summary
+library(knitr)
+
+kable(cv_summary, digits = 3, caption = "Table 5. 10-fold cross-validation results across models (mean RMSE and R-squared).")
+
+```
+
+
+
+```{r,echo=FALSE}
+param_table <- as.data.frame(summary(model_gam_interact)$p.table)
+
+colnames(param_table) <- c("Estimate", "Std. Error", "t-value", "p-value")
+
+param_table$Term <- rownames(param_table)
+rownames(param_table) <- NULL
+
+param_table$Signif. <- cut(
+  param_table$`p-value`,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf),
+  labels = c("***", "**", "*", ".", " "),
+  right = TRUE
+)
+
+param_table <- param_table[, c("Term", "Estimate", "Std. Error", "t-value", "p-value", "Signif.")]
+
+kable(param_table, digits = 3, caption = "Table 1. Parametric coefficients from the GAM model.")
+
+```
+
+```{r,echo=FALSE}
+library(knitr)
+smooth_table <- as.data.frame(summary(model_gam_interact)$s.table)
+
+colnames(smooth_table) <- c("edf", "Ref.df", "F", "p-value")
+
+smooth_table$Term <- rownames(smooth_table)
+rownames(smooth_table) <- NULL
+
+smooth_table <- smooth_table[, c("Term", "edf", "Ref.df", "F", "p-value")]
+
+kable(smooth_table, digits = 3, caption = "Table 2. Approximate significance of smooth terms in the GAM model.")
+
+smooth_table$Signif. <- cut(
+  smooth_table$`p-value`,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf),
+  labels = c("***", "**", "*", ".", " "),
+  right = TRUE
+)
+kable(smooth_table, digits = 3, caption = "Table 2. Approximate significance of smooth terms in the GAM model.")
+
+
+```
+
+
+# Part 4: Inferential & Predictive Testing Procedures (Linear Regression)
+
+library(car)
+library(boot)
+library(caret)
+
+# 4.1 interactivity Model Comparison (ANOVA)
+aov_comp <- anova(model_nointeract, model_interact, test = "Chisq")
+print(aov_comp)
+
+# 4.2 Coefficient Hypothesis Tests
+predictors <- c(
+  "log_gdp", "cpi", "infant_mortality", "unemployment_rate",
+  "intnet_use", "Education_Expenditure", "Medical_Expenditure",
+  "Intentional_Homicides", "Political_Stability"
+)
+
+# Per-predictor joint tests of middle & high interaction coefficients
+for (p in predictors) {
+  cat("\nTesting interactions for", p, ":\n")
+  terms <- c(
+    paste0(p, ":income_group_3catmiddle = 0"),
+    paste0(p, ":income_group_3cathigh   = 0")
+  )
+  print(linearHypothesis(model_interact, terms, test = "F"))
+}
+
+# Joint test of all interaction terms simultaneously
+all_ints <- grep(":", names(coef(model_interact)), value = TRUE)
+hyp_all  <- paste0(all_ints, " = 0")
+cat("\nJoint test of ALL interaction terms:\n")
+print(linearHypothesis(model_interact, hyp_all, test = "F"))
+
+# 4.3 Bootstrap Confidence Intervals for Key Coefficient
+bootstrap_fn <- function(data, indices) {
+  d <- data[indices, ]
+  coef(
+    lm(HF ~ log_gdp, data = d[d$income_group_3cat == 'low', ])
+  )["log_gdp"]
+}
+set.seed(5291)
+boot_res <- boot(freedom_cleaned, bootstrap_fn, R = 1000)
+ci <- boot.ci(boot_res, type = "perc")
+print(ci)
+
+# 4.4 Predictive Calibration Plot for final_linear
+library(dplyr)
+library(ggplot2)
+
+# get predicted values
+freedom_cal <- freedom_cleaned %>%
+  mutate(
+    Pred_HF = predict(final_linear, newdata = freedom_cleaned),
+    Bin = ntile(Pred_HF, 10)  # divide into 10 regions
+  ) %>%
+  group_by(Bin) %>%
+  summarise(
+    Mean_Pred = mean(Pred_HF),
+    Mean_Obs  = mean(HF)
+  )
+
+ggplot(freedom_cal, aes(x = Mean_Pred, y = Mean_Obs)) +
+  geom_point(size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    title = "Calibration Plot (Regression)",
+    x = "Mean Predicted HF (by decile)",
+    y = "Mean Observed HF (by decile)"
+  ) +
+  theme_minimal()
+#*Interpretation:* compares predicted vs. observed quantiles of HF to assess systematic bias in predictions.
+#-----------------------------------------------------------------------------------------------------
+# Part4 Extension: Inferential & Predictive Tests (Nonparametric Models)
+
+# --- 4.1 Spline Model: Test whether interacting splines improves fit ---
+# Compare nested spline models via likelihood ratio (Chi-square) test
+test_spline <- anova(model_spline, model_spline_interact, test = "Chisq")
+print(test_spline)
+
+# --- 4.2 GAM: Test significance of group-specific smooths ---
+#  compare the base GAM vs. the interaction GAM
+test_gam <- anova.gam(model_gam, model_gam_interact, test = "F")
+print(test_gam)
+
+# inspect approximate p-values of each smooth term
+cat("\nSmooth term significance (model_gam_interact):\n")
+print(summary(model_gam_interact)$s.table)
+
+# --- 4.3 Random Forest: Permutation test for variable importance ---
+# Permutation-based significance of RF variable importance
+set.seed(5291)
+rf_perm <- rfPermute(
+  HF ~ log_gdp + cpi + infant_mortality + unemployment_rate + intnet_use +
+    Education_Expenditure + Medical_Expenditure + Intentional_Homicides +
+    Political_Stability + income_group_3cat,
+  data = freedom_cleaned,
+  ntree = 500,
+  nrep = 100    
+)
+print(rf_perm)
+# View p-values for each variable's importance
+eval_perm <- importance(rf_perm)
+print(eval_perm)
+
+# --- 4.4 More Nonparametric Tests (Kruskal–Wallis & Dunn's post-hoc tests)  ---
+
+library(dunn.test)     # Dunn’s post-hoc test
+df <- freedom_cleaned
+
+# Nonparametric group tests
+# Boxplot for HF by income group
+ggplot(df, aes(income_group_3cat, HF)) +
+  geom_boxplot(fill="lightgray") +
+  labs(title="HF by Income Group",
+       x="Income Group", y="Human Freedom Score") +
+  theme_minimal()
+
+# Kruskal–Wallis & Dunn's post-hoc on HF
+kruskal_hf <- kruskal.test(HF ~ income_group_3cat, data = df)
+print(kruskal_hf)
+dunn_hf <- dunn.test(df$HF, df$income_group_3cat,
+                     method="bonferroni", alpha=0.05)
+print(dunn_hf)
+
+
